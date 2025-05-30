@@ -15,6 +15,7 @@ const BNODE_LEAF: u16 = 2; // leaf nodes with values
 const BNODE_FREE: u16 = 3; // free nodes
 const FREE_LIST_HEADER: usize = 4 + 8 + 8;
 const FREE_LIST_CAP: usize = (BTREE_PAGE_SIZE - FREE_LIST_HEADER) / 8;
+use std::collections::HashMap;
 
 
 
@@ -696,7 +697,7 @@ mod tests {
             }
         }
               // All keys should now be deleted
-              for i in 0..20 {
+            for i in 0..20 {
                 let key = format!("key{:02}", i);
                 assert_eq!(btree.get(key.as_bytes()), None);
             }
@@ -705,34 +706,97 @@ mod tests {
 
 
 pub fn main() {
-
-    fn main() -> std::io::Result<()> {
-        // 1. Create a KV instance with a file path
-        use std::path::Path;
-        let path = Path::new("my_database.db");
-        let mut database = KV::new(path);
-        
-        // 2. Open the database
-        database.open()?;
-        
-        // 3. Store data
-        database.set(b"user:1001", b"John Doe")?;
-        database.set(b"user:1002", b"Jane Smith")?;
-        database.set(b"counter", b"42")?;
-        
-        // 4. Retrieve data
-        if let Some(value) = database.get(b"user:1001") {
-            println!("User 1001: {}", String::from_utf8_lossy(&value));
-        }
-        
-        // 5. Delete data
-        database.delete(b"counter")?;
-        
-        // 6. Close the database
-        database.close();
-        
-        Ok(())
+    match run_example() {
+        Ok(_) => println!("Database operations completed successfully!"),
+        Err(e) => eprintln!("Error: {}", e),
     }
+}
+
+fn run_example() -> std::io::Result<()> {
+    // Create a KV instance with a file path
+    let path = Path::new("my_database.db");
+    let mut database = KV::new(path);
+    
+    // Open the database
+    println!("Opening database at {}", path.display());
+    database.open()?;
+    
+    // Store data
+    println!("\nStoring data...");
+    database.set(b"user:1001", b"John Doe")?;
+    database.set(b"user:1002", b"Jane Smith")?;
+    database.set(b"counter", b"42")?;
+    
+    // Retrieve data
+    println!("\nRetrieving data...");
+    if let Some(value) = database.get(b"user:1001") {
+        println!("User 1001: {}", String::from_utf8_lossy(&value));
+    }
+    if let Some(value) = database.get(b"user:1002") {
+        println!("User 1002: {}", String::from_utf8_lossy(&value));
+    }
+    if let Some(value) = database.get(b"counter") {
+        println!("Counter: {}", String::from_utf8_lossy(&value));
+    }
+    
+    // Update data
+    println!("\nUpdating data...");
+    database.set(b"user:1001", b"John Doe Jr.")?;
+    if let Some(value) = database.get(b"user:1001") {
+        println!("Updated User 1001: {}", String::from_utf8_lossy(&value));
+    }
+    
+    // Delete data
+    println!("\nDeleting data...");
+    match database.delete(b"counter")? {
+        true => println!("Counter deleted successfully"),
+        false => println!("Counter not found"),
+    }
+    
+    // Verify deletion
+    match database.get(b"counter") {
+        Some(value) => println!("Counter still exists: {}", String::from_utf8_lossy(&value)),
+        None => println!("Counter confirmed deleted"),
+    }
+    
+    // Close the database
+    println!("\nClosing database...");
+    database.close();
+    
+    // Reopen and check persistence
+    println!("\nReopening database to check persistence...");
+    let mut database = KV::new(path);
+    database.open()?;
+    
+    if let Some(value) = database.get(b"user:1001") {
+        println!("Persisted User 1001: {}", String::from_utf8_lossy(&value));
+    }
+    if let Some(value) = database.get(b"user:1002") {
+        println!("Persisted User 1002: {}", String::from_utf8_lossy(&value));
+    }
+    match database.get(b"counter") {
+        Some(value) => println!("Counter: {}", String::from_utf8_lossy(&value)),
+        None => println!("Counter confirmed deleted after reopening"),
+    }
+    
+    // Store some binary data
+    println!("\nStoring binary data...");
+    let binary_data = vec![0, 1, 2, 3, 255, 254, 253, 252];
+    database.set(b"binary_key", &binary_data)?;
+    
+    // Retrieve binary data
+    if let Some(value) = database.get(b"binary_key") {
+        println!("Binary data: {:?}", value);
+    }
+    
+    // Final close
+    println!("\nFinal database close");
+    database.close();
+    
+    println!("\nDatabase file created at: {}", path.display());
+    println!("You can examine this file or use it in other applications");
+    
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1045,7 +1109,9 @@ struct MmapInfo {
 
 struct PageInfo {
     flushed : u64,
-    temp : Vec<Vec<u8>>
+    nfree : i64,
+    nappend : usize,
+    updates: HashMap<u64, Option<Vec<u8>>>,
 }
 
 pub struct KV {
@@ -1053,24 +1119,33 @@ pub struct KV {
     file : Option<File>,
     mmap : MmapInfo,
     page : PageInfo,
-    tree : BTree
+    tree : BTree,
+    free : FreeList
 }
 
 impl KV {
-    pub fn new(path : impl AsRef<Path>) -> Self {
+    pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
-            path : path.as_ref().to_string_lossy().to_string(),
-            file : None,
-            mmap : MmapInfo {
-                file_size : 0,
-                total_mapped : 0,
-                chunks : Vec::new()
+            path: path.as_ref().to_string_lossy().to_string(),
+            file: None,
+            mmap: MmapInfo {
+                file_size: 0,
+                total_mapped: 0,
+                chunks: Vec::new()
             },
-            page : PageInfo {
-                flushed : 0,
-                temp : Vec::new()
+            page: PageInfo {
+                flushed: 0,
+                nfree: 0,
+                nappend: 0,
+                updates: HashMap::new(),
             },
-            tree : BTree::new()
+            tree: BTree::new(),
+            free: FreeList {
+                head: 0,
+                get: Box::new(|_| BNode::new(BTREE_PAGE_SIZE)),
+                new: Box::new(|_| 1),
+                use_page: Box::new(|_, _| {}),
+            },
         }
     }
 
@@ -1113,78 +1188,111 @@ impl KV {
         Ok(())
     }
 
-    fn page_get(&self , ptr : u64) -> BNode {
-        let mut start = 0u64;
+    fn page_get(&self, ptr: u64) -> BNode {
+        if let Some(Some(page)) = self.page.updates.get(&ptr) {
+            return BNode::from_bytes(page);
+        }
+        self.page_get_mapped(ptr)
+    }
 
+    fn page_get_mapped(&self, ptr: u64) -> BNode {
+        let mut start = 0u64;
         for chunk in &self.mmap.chunks {
             let end = start + (chunk.len() / BTREE_PAGE_SIZE) as u64;
             if ptr < end {
                 let offset = BTREE_PAGE_SIZE * (ptr - start) as usize;
-                let page_data : &[u8] = &chunk[offset..offset + BTREE_PAGE_SIZE];
-                // ATTENTION
+                let page_data = &chunk[offset..offset + BTREE_PAGE_SIZE];
                 return BNode::from_bytes(page_data);
             }
-            start = end;          
+            start = end;
         }
-        panic!("Page not found");
+        panic!("Bad pointer: {}", ptr);
     }
-    // Allocate a new page
+
+    // Callback for BTree, allocate a new page
     fn page_new(&mut self, node: BNode) -> u64 {
         assert!(node.data.len() <= BTREE_PAGE_SIZE);
-        let ptr = self.page.flushed + self.page.temp.len() as u64;
-        self.page.temp.push(node.data);
+        let ptr;
+        
+        if self.page.nfree < self.free.Total() {
+            // Reuse a deallocated page
+            ptr = self.free.Get(self.page.nfree);
+            self.page.nfree += 1;
+        } else {
+            // Append a new page
+            ptr = self.page.flushed + self.page.nappend as u64;
+            self.page.nappend += 1;
+        }
+        
+        self.page.updates.insert(ptr, Some(node.data));
         ptr
     }
 
-    // Deallocate a page (placeholder)
-    fn page_del(&mut self, _ptr: u64) {
-        // TODO: implement free list
+    // Callback for BTree, deallocate a page
+    fn page_del(&mut self, ptr: u64) {
+        self.page.updates.insert(ptr, None);
+    }
+    // Callback for FreeList, allocate a new page
+    fn page_append(&mut self, node: BNode) -> u64 {
+        assert!(node.data.len() <= BTREE_PAGE_SIZE);
+        let ptr = self.page.flushed + self.page.nappend as u64;
+        self.page.nappend += 1;
+        self.page.updates.insert(ptr, Some(node.data));
+        ptr
+    }
+    
+    // Callback for FreeList, reuse a page
+    fn page_use(&mut self, ptr: u64, node: BNode) {
+        self.page.updates.insert(ptr, Some(node.data));
     }
 
-    // Load master page
+
     fn master_load(&mut self) -> io::Result<()> {
         if self.mmap.file_size == 0 {
             // Empty file, master page will be created on first write
             self.page.flushed = 1; // reserved for master page
             return Ok(());
         }
-
-        let data = &self.mmap.chunks[0][0..32];
+        
+        let data = &self.mmap.chunks[0][0..40]; // Read 40 bytes instead of 32
         let mut cursor = std::io::Cursor::new(data);
         
-        // Skip signature for now, read root and used pages
+        // Skip signature for now, read root, used pages, and free list head
         cursor.set_position(16);
         let root = cursor.read_u64::<LittleEndian>()?;
         let used = cursor.read_u64::<LittleEndian>()?;
-
+        let free_head = cursor.read_u64::<LittleEndian>()?;
+        
         // Verify signature
         if &data[0..16] != DB_SIG {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad signature"));
         }
-
+        
         // Verify bounds
         let max_pages = (self.mmap.file_size / BTREE_PAGE_SIZE as u64) as u64;
         if !(1 <= used && used <= max_pages) || !(root < used) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad master page"));
         }
-
+        
         self.tree.root = root;
         self.page.flushed = used;
+        self.free.head = free_head;
+        
         Ok(())
     }
-
-    // Store master page atomically
+    
     fn master_store(&mut self) -> io::Result<()> {
-        let mut data = [0u8; 32];
+        let mut data = [0u8; 40]; // Increased from 32 to 40 to include free list pointer
         
         // Write signature
         data[0..16].copy_from_slice(DB_SIG);
         
-        // Write root and used pages
+        // Write root, used pages, and free list head
         let mut cursor = std::io::Cursor::new(&mut data[16..]);
         cursor.write_u64::<LittleEndian>(self.tree.root)?;
         cursor.write_u64::<LittleEndian>(self.page.flushed)?;
-
+        cursor.write_u64::<LittleEndian>(self.free.head)?;
+        
         // Use pwrite for atomic update
         let file = self.file.as_mut().unwrap();
         file.seek(SeekFrom::Start(0))?;
@@ -1234,7 +1342,7 @@ impl KV {
         // Store file handle
         self.file = Some(file);
 
-        // Configure B-tree callbacks
+        // Configure BTree callbacks
         let kv_ptr = self as *mut KV;
         
         // Set the get function to use page_get
@@ -1254,12 +1362,31 @@ impl KV {
         let kv_ptr = self as *mut KV;
         self.tree.del = Box::new(move |ptr| {
             let kv = unsafe { &mut *kv_ptr };
-            kv.page_del(ptr)
+            kv.page_del(ptr);
         });
-
+        
+        // Configure FreeList callbacks
+        let kv_ptr = self as *mut KV;
+        self.free.get = Box::new(move |ptr| {
+            let kv = unsafe { &*kv_ptr };
+            kv.page_get(ptr)
+        });
+        
+        let kv_ptr = self as *mut KV;
+        self.free.new = Box::new(move |node| {
+            let kv = unsafe { &mut *kv_ptr };
+            kv.page_append(node)
+        });
+        
+        let kv_ptr = self as *mut KV;
+        self.free.use_page = Box::new(move |ptr, node| {
+            let kv = unsafe { &mut *kv_ptr };
+            kv.page_use(ptr, node);
+        });
+        
         // Load master page
         self.master_load()?;
-
+        
         Ok(())
     }
 
@@ -1269,39 +1396,43 @@ impl KV {
         self.file = None;
     }
 
-    // Write pending pages to file
     fn write_pages(&mut self) -> io::Result<()> {
-        let npages = self.page.flushed as usize + self.page.temp.len();
-        
-        // Extend file and mmap if needed
-        self.extend_file(npages)?;
-        self.extend_mmap(npages)?;
-
-        // Copy data to mapped memory
-        for (i, page_data) in self.page.temp.iter().enumerate() {
-            let ptr = self.page.flushed + i as u64;
-            
-            // Find the correct chunk and offset
-            let mut start = 0u64;
-            for chunk in &mut self.mmap.chunks {
-                let chunk_pages = chunk.len() / BTREE_PAGE_SIZE;
-                let end = start + chunk_pages as u64;
-                
-                if ptr >= start && ptr < end {
-                    // Found the correct chunk
-                    let offset = BTREE_PAGE_SIZE * (ptr - start) as usize;
-                    
-                    // Copy the page data to the mmap
-                    if offset + BTREE_PAGE_SIZE <= chunk.len() {
-                        chunk[offset..offset + page_data.len()].copy_from_slice(page_data);
-                    }
-                    break;
-                }
-                
-                start = end;
+        // Update the free list
+        let mut freed = Vec::new();
+        for (&ptr, page) in &self.page.updates {
+            if page.is_none() {
+                freed.push(ptr);
             }
         }
-
+        
+        self.free.Update(self.page.nfree, freed);
+        
+        // Extend file and mmap if needed
+        let npages = self.page.flushed as usize + self.page.nappend;
+        self.extend_file(npages)?;
+        self.extend_mmap(npages)?;
+        
+        // Copy pages to the file
+        for (&ptr, page) in &self.page.updates {
+            if let Some(page_data) = page {
+                let mut start = 0u64;
+                for chunk in &mut self.mmap.chunks {
+                    let chunk_pages = chunk.len() / BTREE_PAGE_SIZE;
+                    let end = start + chunk_pages as u64;
+                    
+                    if ptr >= start && ptr < end {
+                        let offset = BTREE_PAGE_SIZE * (ptr - start) as usize;
+                        if offset + BTREE_PAGE_SIZE <= chunk.len() {
+                            chunk[offset..offset + page_data.len()].copy_from_slice(page_data);
+                        }
+                        break;
+                    }
+                    
+                    start = end;
+                }
+            }
+        }
+        
         Ok(())
     }
 
@@ -1313,8 +1444,8 @@ impl KV {
         }
     
         // Update counters
-        self.page.flushed += self.page.temp.len() as u64;
-        self.page.temp.clear();
+        self.page.flushed += self.page.nappend as u64;
+        self.page.nappend = 0;
     
         // Update and flush master page
         self.master_store()?;
@@ -1352,6 +1483,7 @@ impl KV {
         }
         Ok(deleted)
     }
+    
 }
 
 
@@ -1361,25 +1493,166 @@ struct FreeList {
     head : u64,
     get : Box<dyn Fn(u64) -> BNode>,
     new : Box<dyn Fn(BNode) -> u64>,
-    used : Box<dyn Fn(u64) -> bool>,
+    use_page: Box<dyn Fn(u64, BNode)>,
 }
+
+// Get the number of pointers in a free list node
+fn flnSize(node: &BNode) -> i64 {
+    (u16::from_le_bytes([node.data[2], node.data[3]])) as i64
+}
+// Get the next node pointer from a free list node
+fn flnNext(node: &BNode) -> u64 {
+    u64::from_le_bytes([
+        node.data[4], node.data[5], node.data[6], node.data[7],
+        node.data[8], node.data[9], node.data[10], node.data[11],
+    ])
+}
+// Get a pointer stored in a free list node
+fn flnPtr(node: &BNode, idx: i64) -> u64 {
+    let pos = FREE_LIST_HEADER + 8 * idx as usize;
+    u64::from_le_bytes([
+        node.data[pos], node.data[pos + 1], node.data[pos + 2], node.data[pos + 3],
+        node.data[pos + 4], node.data[pos + 5], node.data[pos + 6], node.data[pos + 7],
+    ])
+}
+// Set the header of a free list node (size and next pointer)
+fn flnSetHeader(node: &mut BNode, size: u16, next: u64) {
+    // Set node type to BNODE_FREE
+    node.data[0..2].copy_from_slice(&BNODE_FREE.to_le_bytes());
+    // Set size
+    node.data[2..4].copy_from_slice(&size.to_le_bytes());
+    // Set next pointer
+    node.data[4..12].copy_from_slice(&next.to_le_bytes());
+}
+
+// Set a pointer in a free list node
+fn flnSetPtr(node: &mut BNode, idx: usize, ptr: u64) {
+    let pos = FREE_LIST_HEADER + 8 * idx;
+    node.data[pos..pos + 8].copy_from_slice(&ptr.to_le_bytes());
+}
+
+// Set the total count in the free list (stored in the first node)
+fn flnSetTotal(node: &mut BNode, total: u64) {
+    // Set the total count in the first 8 bytes of the node
+    node.data[12..20].copy_from_slice(&total.to_le_bytes());
+}
+
+
+
 
 impl FreeList {
     pub fn Total(&self) -> i64 {
-        return self.head as i64;
-        // * TODO REAL IMPL
+        if self.head == 0 {
+            return 0;
+        }
+        let node = (self.get)(self.head);
+        let total_bytes = [
+            node.data[12], node.data[13], node.data[14], node.data[15],
+            node.data[16], node.data[17], node.data[18], node.data[19],
+        ];
+        u64::from_le_bytes(total_bytes) as i64
     }
 
-    pub fn Get(&self , topn : i64) -> u64 {
-        return 0;
-        // * TODO REAL IMPL
+    pub fn Get(&self, topn: i64) -> u64 {
+        assert!(0 <= topn && topn < self.Total());
+        let mut node = (self.get)(self.head);
+        let mut remaining = topn;
+        
+        while flnSize(&node) <= remaining {
+            remaining -= flnSize(&node);
+            let next = flnNext(&node);
+            assert!(next != 0);
+            node = (self.get)(next);
+        }
+        
+        flnPtr(&node, flnSize(&node) - remaining - 1)
     }
+    
+    pub fn Update(&mut self, popn: i64, mut freed: Vec<u64>) {
+        // If there's nothing to pop or free, do nothing
+        if popn == 0 && freed.is_empty() {
+            return;
+        }
 
-    pub fn Update(&self , popn : i64 , ptr : Vec<u64>) -> u64 {
-        // * TODO REAL IMPL
+        // Get total available items
+        let mut total = self.Total();
+        
+        // Limit popn to available items
+        let popn = popn.min(total);
+        
+        // Prepare to construct the new list
+        let mut reuse: Vec<u64> = Vec::new();
+        let mut remaining_popn = popn;
+        
+        // Phase 1 & 2: Remove items and collect reusable pointers
+        while self.head != 0 && reuse.len() * FREE_LIST_CAP < freed.len() {
+            let node = (self.get)(self.head);
+            freed.push(self.head); // recycle the node itself
+            
+            let node_size = flnSize(&node);
+            if remaining_popn >= node_size {
+                // Phase 1: Remove all pointers in this node
+                remaining_popn -= node_size;
+            } else {
+                // Phase 2: Remove some pointers and reuse others
+                let mut remain = node_size - remaining_popn;
+                remaining_popn = 0;
+                
+                // Reuse pointers from the free list itself
+                while remain > 0 && reuse.len() * FREE_LIST_CAP < freed.len() + remain as usize {
+                    remain -= 1;
+                    reuse.push(flnPtr(&node, remain));
+                }
+                
+                // Move the remaining pointers into the `freed` list
+                for i in 0..remain {
+                    freed.push(flnPtr(&node, i));
+                }
+            }
+            
+            // Discard the node and move to the next node
+            total -= node_size;
+            self.head = flnNext(&node);
+        }
+        
+        assert!(reuse.len() * FREE_LIST_CAP >= freed.len() || self.head == 0);
+        
+        // Phase 3: Prepend new nodes
+        self.push(&mut freed, &mut reuse);
+        
+        // Update the total count
+        if self.head != 0 {
+            let mut head_node = (self.get)(self.head);
+            flnSetTotal(&mut head_node, (total + freed.len() as i64) as u64);
+            (self.use_page)(self.head, head_node);
+        }
     }
-
-
-
+    
+    fn push(&mut self, freed: &mut Vec<u64>, reuse: &mut Vec<u64>) {
+        while !freed.is_empty() {
+            let mut new_node = BNode::new(BTREE_PAGE_SIZE);
+            
+            // Construct a new node
+            let size = freed.len().min(FREE_LIST_CAP);
+            flnSetHeader(&mut new_node, size as u16, self.head);
+            
+            for i in 0..size {
+                flnSetPtr(&mut new_node, i, freed[i]);
+            }
+            
+            *freed = freed[size..].to_vec();
+            
+            if !reuse.is_empty() {
+                // Reuse a pointer from the list
+                let ptr = reuse.remove(0);
+                (self.use_page)(ptr, new_node);
+                self.head = ptr;
+            } else {
+                // Or append a page to house the new node
+                self.head = (self.new)(new_node);
+            }
+        }
+        
+        assert!(reuse.is_empty());
+    }
 }
-
