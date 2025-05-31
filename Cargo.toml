@@ -1,9 +1,14 @@
 [package]
 name = "database-rust"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-byteorder = "1.5.0"
-memmap2 = "0.9.5"
-tempfile = "3.20.0"
+byteorder = "1.4.3"
+memmap2 = "0.5.8"
+tempfile = "3.3.0"
+hex = "0.4.3"  # Pour l'affichage hexadécimal des données binaires
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lazy_static = "1.4.0"
+rand = "0.9.1"
