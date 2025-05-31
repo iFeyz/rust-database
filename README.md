@@ -87,6 +87,10 @@ database.close();
 - Free list reduces disk space waste and fragmentation
 
 ---
+### TODO
+
+- Separate the strucutre of the file to have a better reading
+- Adding more options
 
 ## Français
 
