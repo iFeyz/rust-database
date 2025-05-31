@@ -10,6 +10,8 @@ use std::fmt::{self, Display, Formatter};
 use std::error::Error as StdError;
 use serde::{Serialize, Deserialize};
 use lazy_static::lazy_static;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 const HEADER: usize = 4;
 const BTREE_PAGE_SIZE: usize = 4096;
@@ -1682,6 +1684,20 @@ pub struct TableDef {
     prefix: u32,
 }
 
+impl TableDef {
+    pub fn new(name: &str, types: Vec<u32>, cols: Vec<String>, pkeys: i32, prefix: u32) -> Self {
+        TableDef {
+            name: name.to_string(),
+            types: types,
+            cols: cols,
+            pkeys: pkeys,
+            prefix: prefix,
+        }
+    }
+}
+
+
+
 pub struct Db {
     path: String,
     kv: KV,
@@ -2131,36 +2147,68 @@ impl Db {
         }
     }
 
-    pub fn scan(&mut self, table : &str, req : &mut Scanner) -> Result<(), DbError> {
-        let tdef = self.get_table_def(table).ok_or(DbError::new(&format!("table not found: {}", table)))?;
+    pub fn scan(&mut self, table: &str, req: &mut Scanner) -> Result<(), DbError> {
+        let tdef = self.get_table_def(table)
+            .ok_or_else(|| DbError::new(&format!("table not found: {}", table)))?;
         
         dbScan(self, &tdef, req)
     }
 }
 
-fn dbScan(db : &Db, tdef : &TableDef, req : &mut Scanner) -> Result<(), DbError> {
-    //* Sanity check
-    if (req.Cmp1 < 0 && req.Cmp2 > 0) || (req.Cmp2 < 0 && req.Cmp1 > 0) {
-        return Err(DbError::new("invalid scan range"));
+fn dbScan(db: &mut Db, tdef: &TableDef, req: &mut Scanner) -> Result<(), DbError> {
+    // Sanity check
+    match (req.Cmp1 > 0, req.Cmp2 < 0) {
+        (true, true) | (false, false) => {
+            return Err(DbError::new("bad range"));
+        }
+        _ => {}
     }
+
     let values1 = check_record(tdef, &req.Key1, tdef.pkeys as usize)?;
     let values2 = check_record(tdef, &req.Key2, tdef.pkeys as usize)?;
+    
     req.tdef = tdef.clone();
+    
     let key_start = encode_key(tdef.prefix, &values1[0..tdef.pkeys as usize]);
-    let key_end = encode_key(tdef.prefix, &values2[0..tdef.pkeys as usize]);
-    let mut iter = db.kv.tree.seek(&key_start, req.Cmp1);
+    req.keyEnd = encode_key(tdef.prefix, &values2[0..tdef.pkeys as usize]);
+    
+    // Note: This is a simplified approach. In reality, you'd need proper lifetime management
+    // For now, we'll create a new iterator (this won't compile due to lifetime issues)
+    // You'll need to restructure your code to handle lifetimes properly
+    
     Ok(())
+}
+
+fn dbGet(db: &mut Db, tdef: &TableDef, rec: &mut Record) -> Result<bool, DbError> {
+    let mut sc = Scanner {
+        Cmp1: CMP_GE,
+        Cmp2: CMP_LE,
+        Key1: rec.clone(),
+        Key2: rec.clone(),
+        tdef: tdef.clone(),
+        iter: None, // Will be set in dbScan
+        keyEnd: Vec::new(),
+    };
+    
+    dbScan(db, tdef, &mut sc)?;
+    
+    if sc.valid() {
+        sc.deref(rec);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 pub fn main() {
     // Run the key-value store example first
-    //match run_simple_kv_example() {
-    //    Ok(_) => println!("Operations on key-value database completed successfully!"),
-    //    Err(e) => {
-    //        eprintln!("Error with key-value database: {}", e);
-    //        return;
-    //    }
-    //}
+    match run_simple_kv_example() {
+        Ok(_) => println!("Operations on key-value database completed successfully!"),
+        Err(e) => {
+            eprintln!("Error with key-value database: {}", e);
+            return;
+        }
+    }
     
     // Then try to run the tabular database example
     println!("\n--- Now attempting to run the tabular database example ---\n");
@@ -2170,6 +2218,9 @@ pub fn main() {
     }
 
     demonstrate_order_preservation();
+    
+    // Demonstrate range query functionality
+    test_range_query();
 }
 
 fn run_simple_kv_example() -> std::io::Result<()> {
@@ -2860,27 +2911,113 @@ const CMP_LT : i8 = -2;
 const CMP_LE : i8 = -3;
 
 impl<'a> BTreeIter<'a> {
+    pub fn new(tree: &'a BTree) -> Self {
+        Self {
+            tree,
+            path: Vec::new(),
+            index: Vec::new(),
+        }
+    }
 
     pub fn Deref(&self) -> (Vec<u8>, Vec<u8>) {
-        //TODO
-        return (vec![], vec![]);
+        if !self.Valid() {
+            return (vec![], vec![]);
+        }
+        
+        let level = self.path.len() - 1;
+        let node = &self.path[level];
+        let idx = self.index[level];
+        
+        // Get key and value from the leaf node
+        let key = node.getKey(idx).to_vec();
+        let val = node.getVal(idx).to_vec();
+        
+        (key, val)
     }
+
     pub fn Valid(&self) -> bool {
-        // TODO
-        return false;
+        if self.path.is_empty() {
+            return false;
+        }
+        
+        let level = self.path.len() - 1;
+        let node = &self.path[level];
+        let idx = self.index[level];
+        
+        // Check if we're still within bounds of the current leaf node
+        idx < node.nkeys()
     }
-    pub fn Prev(&mut self) {
-        // TODO
-    }
+
     pub fn Next(&mut self) {
-        //TODO
+        if !self.Valid() {
+            return;
+        }
+        
+        let level = self.path.len() as i32 - 1;
+        self.iterNext(level);
     }
-    
-    pub fn iterPrev(&mut self, level : i32) {
+
+    pub fn Prev(&mut self) {
+        if !self.Valid() {
+            return;
+        }
+        
+        let level = self.path.len() as i32 - 1;
+        self.iterPrev(level);
+    }
+
+    fn iterNext(&mut self, level: i32) {
+        let level_usize = level as usize;
+        if level_usize >= self.path.len() {
+            return;
+        }
+        
+        // Check if we can move to the next key in the current node
+        let can_move_next = {
+            let node = &self.path[level_usize];
+            self.index[level_usize] + 1 < node.nkeys()
+        };
+        
+        if can_move_next {
+            // Case 1: Move to the next key in current node
+            self.index[level_usize] += 1;
+        } else if level > 0 {
+            // Case 2: Current node exhausted, move up and then potentially down
+            self.iterNext(level - 1);
+            
+            // After moving up, check if parent index is valid
+            if level_usize > 0 && level_usize - 1 < self.path.len() && 
+               self.index[level_usize - 1] < self.path[level_usize - 1].nkeys() {
+                let ptr = {
+                    let parent = &self.path[level_usize - 1];
+                    parent.getPtr(self.index[level_usize - 1])
+                };
+                
+                let child = (self.tree.get)(ptr);
+                
+                if level_usize < self.path.len() {
+                    self.path[level_usize] = child;
+                    self.index[level_usize] = 0;
+                }
+            } else {
+                // If we can't go down, mark this level as invalid
+                if level_usize < self.index.len() {
+                    let node_keys = self.path[level_usize].nkeys();
+                    self.index[level_usize] = node_keys; // Set to end to mark as invalid
+                }
+            }
+        } else {
+            // Case 3: Root node exhausted, mark iterator as invalid
+            let node_keys = self.path[level_usize].nkeys();
+            self.index[level_usize] = node_keys; // Set to end to mark as invalid
+        }
+    }
+
+    pub fn iterPrev(&mut self, level: i32) {
         if self.index[level as usize] > 0 {
             self.index[level as usize] -= 1;
         } else if level > 0 {
-            self.iterPrev(level -1);
+            self.iterPrev(level - 1);
         } else {
             return;
         }
@@ -2893,11 +3030,7 @@ impl<'a> BTreeIter<'a> {
             self.index[(level + 1) as usize] = nkeys - 1;
         }
     }
-
-
-    
 }
-
 impl BTree {
 
     pub fn seekle(&self, key : &[u8]) -> BTreeIter {
@@ -2952,30 +3085,189 @@ pub fn cmpOK(key : &[u8], cmp : i8, other : &[u8]) -> bool {
     }
 }
 
-struct Scanner<'a> {
-    Cmp1 : i8,
-    Cmp2 : i8,
-    Key1 : Record,
-    Key2 : Record,
-    tdef  : TableDef,
-    iter : &'a BTreeIter<'a>,
-    keyEnd : Vec<u8>,
+struct Scanner {
+    Cmp1: i8,
+    Cmp2: i8,
+    Key1: Record,
+    Key2: Record,
+    tdef: TableDef,
+    iter: Option<BTreeIter<'static>>, // Made optional to handle initialization
+    keyEnd: Vec<u8>,
 }
 
-impl<'a> Scanner<'a> {
+impl Scanner {
+
 
     pub fn valid(&self) -> bool {
-        //TODO
-        return false;
+        if let Some(ref iter) = self.iter {
+            if !iter.Valid() {
+                return false;
+            }
+            let (cur, _) = iter.Deref();
+            cmpOK(&cur, self.Cmp2, &self.keyEnd)
+        } else {
+            false
+        }
     }
 
     pub fn next(&mut self) {
-        //TODO
+        assert!(self.valid());
+        if let Some(ref mut iter) = self.iter {
+            if self.Cmp1 > 0 {
+                iter.Next();
+            } else {
+                iter.Prev();
+            }
+        }
     }
 
-    pub fn deref(&self , rec : &mut Record) {
-        //TODO
+    pub fn deref(&self, rec: &mut Record) {
+        assert!(self.valid());
+        
+        if let Some(ref iter) = self.iter {
+            // Get the current key-value pair from the B-tree iterator
+            let (_key, _val) = iter.Deref();
+            
+            // For now, we'll skip the decode functions since they're not implemented
+            // You'll need to implement decode_key and decode_values functions
+            
+            // Clear the output record
+            rec.cols.clear();
+            rec.vals.clear();
+            
+            // Simplified version - you'll need to implement proper decoding
+            // This is a placeholder that won't work without the decode functions
+            rec.cols.extend_from_slice(&self.tdef.cols);
+            
+            // Create dummy values for now - replace with actual decoding
+            for _i in 0..self.tdef.cols.len() {
+                rec.vals.push(Value::new_int64(0)); // Placeholder
+            }
+        }
     }
+}
 
-
+fn test_range_query() {
+    println!("\n=== Range Query Demonstration ===\n");
+    
+    // Create a simple in-memory HashMap to store our nodes
+    let pages = Arc::new(Mutex::new(HashMap::<u64, BNode>::new()));
+    let next_id = Arc::new(Mutex::new(1u64));
+    
+    // Create a new BTree with closures for get, new, and del operations
+    let pages_get = Arc::clone(&pages);
+    let pages_new = Arc::clone(&pages);
+    let pages_del = Arc::clone(&pages);
+    let next_id_new = Arc::clone(&next_id);
+    
+    let mut btree = BTree {
+        root: 0,
+        get: Box::new(move |id| {
+            pages_get.lock().unwrap().get(&id).unwrap().clone()
+        }),
+        new: Box::new(move |node| {
+            let mut next_id = next_id_new.lock().unwrap();
+            let id = *next_id;
+            *next_id += 1;
+            pages_new.lock().unwrap().insert(id, node);
+            id
+        }),
+        del: Box::new(move |id| {
+            pages_del.lock().unwrap().remove(&id);
+        }),
+    };
+    
+    // Insert test data - numerical order intentionally scrambled
+    println!("Inserting test data in arbitrary order...");
+    let test_data = [
+        ("key05", "value5"),
+        ("key01", "value1"),
+        ("key09", "value9"),
+        ("key03", "value3"),
+        ("key07", "value7"),
+        ("key02", "value2"),
+        ("key10", "value10"),
+        ("key06", "value6"),
+        ("key04", "value4"),
+        ("key08", "value8"),
+    ];
+    
+    for (key, value) in &test_data {
+        btree.insert(key.as_bytes(), value.as_bytes());
+        println!("  Inserted: {} = {}", key, value);
+    }
+    
+    println!("\nDemonstrating different range query types:");
+    
+    // Test 1: Range query: keys >= "key03" AND keys <= "key07"
+    println!("\n1. Range Query: keys >= \"key03\" AND keys <= \"key07\"");
+    let mut iter = btree.seek(b"key03", CMP_GE);
+    
+    let mut results = Vec::new();
+    while iter.Valid() {
+        let (key, value) = iter.Deref();
+        
+        // Check if we've gone past the upper bound
+        if !cmpOK(&key, CMP_LE, b"key07") {
+            break;
+        }
+        
+        results.push(format!("{} = {}", 
+            String::from_utf8_lossy(&key), 
+            String::from_utf8_lossy(&value)));
+        
+        iter.Next();
+    }
+    
+    println!("   Results: {} values", results.len());
+    for result in results {
+        println!("   - {}", result);
+    }
+    
+    // Test 2: Greater than range query: keys > "key07"
+    println!("\n2. Range Query: keys > \"key07\"");
+    let mut iter = btree.seek(b"key07", CMP_GT);
+    
+    let mut results = Vec::new();
+    while iter.Valid() {
+        let (key, value) = iter.Deref();
+        
+        results.push(format!("{} = {}", 
+            String::from_utf8_lossy(&key), 
+            String::from_utf8_lossy(&value)));
+        
+        iter.Next();
+    }
+    
+    println!("   Results: {} values", results.len());
+    for result in results {
+        println!("   - {}", result);
+    }
+    
+    // Test 3: Less than range query: keys < "key03"
+    println!("\n3. Range Query: keys < \"key03\"");
+    let mut iter = btree.seek(b"key03", CMP_LT);
+    
+    let mut results = Vec::new();
+    while iter.Valid() {
+        let (key, value) = iter.Deref();
+        
+        // Check if we've gone past the boundary
+        if !cmpOK(&key, CMP_LT, b"key03") {
+            break;
+        }
+        
+        results.push(format!("{} = {}", 
+            String::from_utf8_lossy(&key), 
+            String::from_utf8_lossy(&value)));
+        
+        iter.Next();
+    }
+    
+    println!("   Results: {} values", results.len());
+    for result in results {
+        println!("   - {}", result);
+    }
+    
+    println!("\nRange Query demonstration completed successfully!");
 }
