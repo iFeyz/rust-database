@@ -1566,9 +1566,9 @@ impl FreeList {
 
 
 /// DATA STRUCTURES : 
-const TYPE_ERROR : u16 = 0;
-const TYPE_BYTES : u16 = 1;
-const TYPE_INT64 : u16 = 2;
+const TYPE_ERROR : u32 = 0;
+const TYPE_BYTES : u32 = 1;
+const TYPE_INT64 : u32 = 2;
 
 
 
@@ -1603,7 +1603,7 @@ const MODE_UPDATE_ONLY: u8 = 1;   // Mise à jour seulement
 const MODE_INSERT_ONLY: u8 = 2;   // Insertion seulement
 const TABLE_PREFIX_MIN: u32 = 100; // Préfixe minimum pour les tables utilisateur
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Value {
     typ: u32,
     i64: i64,
@@ -1708,7 +1708,7 @@ lazy_static! {
 }
 
 // Fonction pour vérifier et réorganiser un enregistrement
-fn check_record(tdef: &TableDef, rec: Record, n: usize) -> Result<Vec<Value>, DbError> {
+fn check_record(tdef: &TableDef, rec: &Record, n: usize) -> Result<Vec<Value>, DbError> {
     if n > tdef.cols.len() {
         return Err(DbError::new("too many columns"));
     }
@@ -1749,63 +1749,144 @@ fn check_record(tdef: &TableDef, rec: Record, n: usize) -> Result<Vec<Value>, Db
     Ok(values)
 }
 
-// Encodage/décodage des valeurs
-fn encode_values(out: &mut Vec<u8>, vals: &[Value]) {
-    for val in vals {
-        let typ = (val.typ & 0xFF) as u8;
-        out.push(typ);
-        
-        match val.typ {
-            t if t == TYPE_INT64 as u32 => {
-                out.extend_from_slice(&val.i64.to_le_bytes());
+fn encode_values(vals: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    
+    for v in vals {
+        match v.typ {
+            TYPE_INT64 => {
+                // For signed integers, we need to flip the sign bit to make negatives sort correctly
+                // Adding (1 << 63) flips the sign bit: negative numbers become smaller positive numbers
+                let u = (v.i64 as u64).wrapping_add(1u64 << 63);
+                
+                // Use big-endian encoding so most significant bits come first
+                out.extend_from_slice(&u.to_be_bytes());
             },
-            t if t == TYPE_BYTES as u32 => {
-                let len = val.str.len() as u32;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(&val.str);
+            TYPE_BYTES => {
+                // Escape null bytes and the escape byte itself to preserve order
+                let escaped = escape_string(&v.str);
+                out.extend_from_slice(&escaped);
+                out.push(0); // null-terminated
             },
-            _ => panic!("unknown type: {}", val.typ),
+            _ => panic!("unknown type: {}", v.typ),
         }
     }
+    
+    out
 }
 
-fn decode_values(input: &[u8], out: &mut [Value]) {
+// Encodage/décodage des valeurs
+fn decode_values(input: &[u8], schema: &[u32]) -> Vec<Value> {
+    let mut result = Vec::new();
     let mut pos = 0;
-    for val in out.iter_mut() {
+    
+    for &typ in schema {
         if pos >= input.len() {
             break;
         }
         
-        let typ = input[pos] as u32;
-        pos += 1;
-        
         match typ {
-            t if t == TYPE_INT64 as u32 => {
+            TYPE_INT64 => {
+                if pos + 8 > input.len() {
+                    panic!("insufficient data for int64");
+                }
+                
                 let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&input[pos..pos+8]);
-                val.i64 = i64::from_le_bytes(bytes);
+                bytes.copy_from_slice(&input[pos..pos + 8]);
+                let u = u64::from_be_bytes(bytes);
+                
+                // Reverse the sign bit flip
+                let i64_val = (u.wrapping_sub(1u64 << 63)) as i64;
+                
+                result.push(Value::new_int64(i64_val));
                 pos += 8;
             },
-            t if t == TYPE_BYTES as u32 => {
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&input[pos..pos+4]);
-                let len = u32::from_le_bytes(bytes) as usize;
-                pos += 4;
-                val.str = input[pos..pos+len].to_vec();
-                pos += len;
+            TYPE_BYTES => {
+                // Find the null terminator
+                let start = pos;
+                while pos < input.len() && input[pos] != 0 {
+                    pos += 1;
+                }
+                
+                if pos >= input.len() {
+                    panic!("no null terminator found for string");
+                }
+                
+                let escaped = &input[start..pos];
+                let unescaped = unescape_string(escaped);
+                
+                result.push(Value::new_str(&unescaped));
+                pos += 1; // Skip null terminator
             },
             _ => panic!("unknown type: {}", typ),
         }
-        
-        val.typ = typ;
     }
+    
+    result
+}
+
+/// Escape null bytes and escape bytes to preserve lexicographic order
+/// "\x00" becomes "\x01\x01"
+/// "\x01" becomes "\x01\x02"
+fn escape_string(input: &[u8]) -> Vec<u8> {
+    // Count special bytes to pre-allocate
+    let zeros = input.iter().filter(|&&b| b == 0).count();
+    let ones = input.iter().filter(|&&b| b == 1).count();
+    
+    if zeros + ones == 0 {
+        return input.to_vec();
+    }
+    
+    let mut out = Vec::with_capacity(input.len() + zeros + ones);
+    
+    for &ch in input {
+        if ch <= 1 {
+            out.push(0x01);      // Escape marker
+            out.push(ch + 1);    // 0 -> 1, 1 -> 2
+        } else {
+            out.push(ch);
+        }
+    }
+    
+    out
+}
+
+/// Unescape string data
+fn unescape_string(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    
+    while i < input.len() {
+        if input[i] == 0x01 && i + 1 < input.len() {
+            match input[i + 1] {
+                0x01 => {
+                    out.push(0);     // "\x01\x01" -> "\x00"
+                    i += 2;
+                },
+                0x02 => {
+                    out.push(1);     // "\x01\x02" -> "\x01"
+                    i += 2;
+                },
+                _ => {
+                    // Invalid escape sequence, treat as literal
+                    out.push(input[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    
+    out
 }
 
 // Encodage des clés
 fn encode_key(prefix: u32, vals: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&prefix.to_be_bytes());
-    encode_values(&mut out, vals);
+    out.extend_from_slice(&encode_values(vals));
     out
 }
 
@@ -1857,7 +1938,7 @@ impl Db {
     // Opération interne de récupération d'un enregistrement par clé primaire
     fn db_get(&mut self, tdef: &TableDef, rec: &mut Record) -> Result<bool, DbError> {
         // Vérifier et obtenir les valeurs de la clé primaire
-        let values = check_record(tdef, rec.clone(), tdef.pkeys as usize)?;
+        let values = check_record(tdef, rec, tdef.pkeys as usize)?;
         
         // Encoder la clé
         let key = encode_key(tdef.prefix, &values[0..tdef.pkeys as usize]);
@@ -1873,7 +1954,7 @@ impl Db {
             }
             
             // Décoder les valeurs
-            decode_values(&val_bytes, &mut rest_values);
+            rest_values = decode_values(&val_bytes, &tdef.types[tdef.pkeys as usize..]);
             
             // Ajouter les colonnes et valeurs à l'enregistrement
             for i in 0..(tdef.cols.len() - tdef.pkeys as usize) {
@@ -1897,7 +1978,7 @@ impl Db {
     }
     
     // Opération interne de mise à jour d'un enregistrement
-    fn db_update(&mut self, tdef: &TableDef, rec: Record, mode: u8) -> Result<bool, DbError> {
+    fn db_update(&mut self, tdef: &TableDef, rec: &Record, mode: u8) -> Result<bool, DbError> {
         // Vérifier et obtenir toutes les valeurs
         let values = check_record(tdef, rec, tdef.cols.len())?;
         
@@ -1906,7 +1987,7 @@ impl Db {
         
         // Encoder la valeur (colonnes non-clés)
         let mut val = Vec::new();
-        encode_values(&mut val, &values[tdef.pkeys as usize..]);
+        val.extend_from_slice(&encode_values(&values[tdef.pkeys as usize..]));
         
         // Mettre à jour la base de données
         match self.kv.set(&key, &val) {
@@ -1916,27 +1997,27 @@ impl Db {
     }
     
     // API publique pour les opérations de mise à jour
-    pub fn set(&mut self, table: &str, rec: Record, mode: u8) -> Result<bool, DbError> {
+    pub fn set(&mut self, table: &str, rec: &Record, mode: u8) -> Result<bool, DbError> {
         match self.get_table_def(table) {
             Some(tdef) => self.db_update(&tdef, rec, mode),
             None => Err(DbError::new(&format!("table not found: {}", table))),
         }
     }
     
-    pub fn insert(&mut self, table: &str, rec: Record) -> Result<bool, DbError> {
-        self.set(table, rec, MODE_INSERT_ONLY)
+    pub fn insert(&mut self, table: &str, rec: &Record) -> Result<bool, DbError> {
+        self.set(table, &rec, MODE_INSERT_ONLY)
     }
     
-    pub fn update(&mut self, table: &str, rec: Record) -> Result<bool, DbError> {
+    pub fn update(&mut self, table: &str, rec: &Record) -> Result<bool, DbError> {
         self.set(table, rec, MODE_UPDATE_ONLY)
     }
     
-    pub fn upsert(&mut self, table: &str, rec: Record) -> Result<bool, DbError> {
+    pub fn upsert(&mut self, table: &str, rec: &Record) -> Result<bool, DbError> {
         self.set(table, rec, MODE_UPSERT)
     }
     
     // Opération de suppression d'un enregistrement
-    fn db_delete(&mut self, tdef: &TableDef, rec: Record) -> Result<bool, DbError> {
+    fn db_delete(&mut self, tdef: &TableDef, rec: &Record) -> Result<bool, DbError> {
         // Vérifier et obtenir les valeurs de la clé primaire
         let values = check_record(tdef, rec, tdef.pkeys as usize)?;
         
@@ -1950,7 +2031,7 @@ impl Db {
         }
     }
     
-    pub fn delete(&mut self, table: &str, rec: Record) -> Result<bool, DbError> {
+    pub fn delete(&mut self, table: &str, rec: &Record) -> Result<bool, DbError> {
         match self.get_table_def(table) {
             Some(tdef) => self.db_delete(&tdef, rec),
             None => Err(DbError::new(&format!("table not found: {}", table))),
@@ -2032,7 +2113,7 @@ impl Db {
             val.str = (tdef.prefix + 1).to_le_bytes().to_vec();
         }
         
-        match self.db_update(&TDEF_META, meta_rec, MODE_UPSERT) {
+        match self.db_update(&TDEF_META, &meta_rec, MODE_UPSERT) {
             Ok(_) => {},
             Err(e) => return Err(e),
         }
@@ -2041,7 +2122,7 @@ impl Db {
         match serde_json::to_vec(&tdef) {
             Ok(json_bytes) => {
                 table_rec.add_str("def", &json_bytes);
-                match self.db_update(&TDEF_TABLE, table_rec, MODE_UPSERT) {
+                match self.db_update(&TDEF_TABLE, &table_rec, MODE_UPSERT) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -2049,6 +2130,26 @@ impl Db {
             Err(_) => Err(DbError::new("failed to serialize table definition")),
         }
     }
+
+    pub fn scan(&mut self, table : &str, req : &mut Scanner) -> Result<(), DbError> {
+        let tdef = self.get_table_def(table).ok_or(DbError::new(&format!("table not found: {}", table)))?;
+        
+        dbScan(self, &tdef, req)
+    }
+}
+
+fn dbScan(db : &Db, tdef : &TableDef, req : &mut Scanner) -> Result<(), DbError> {
+    //* Sanity check
+    if (req.Cmp1 < 0 && req.Cmp2 > 0) || (req.Cmp2 < 0 && req.Cmp1 > 0) {
+        return Err(DbError::new("invalid scan range"));
+    }
+    let values1 = check_record(tdef, &req.Key1, tdef.pkeys as usize)?;
+    let values2 = check_record(tdef, &req.Key2, tdef.pkeys as usize)?;
+    req.tdef = tdef.clone();
+    let key_start = encode_key(tdef.prefix, &values1[0..tdef.pkeys as usize]);
+    let key_end = encode_key(tdef.prefix, &values2[0..tdef.pkeys as usize]);
+    let mut iter = db.kv.tree.seek(&key_start, req.Cmp1);
+    Ok(())
 }
 
 pub fn main() {
@@ -2067,6 +2168,8 @@ pub fn main() {
         Ok(_) => println!("Operations on tabular database completed successfully!"),
         Err(e) => eprintln!("Error with tabular database: {}", e),
     }
+
+    demonstrate_order_preservation();
 }
 
 fn run_simple_kv_example() -> std::io::Result<()> {
@@ -2597,3 +2700,282 @@ impl Db {
     }
 }
 
+
+/// Demonstrate that the encoding preserves order
+fn demonstrate_order_preservation() {
+    println!("=== Order-Preserving Encoding Demo ===\n");
+    
+    // Test integer ordering
+    println!("1. Integer Ordering Test:");
+    let int_values = vec![-100, -1, 0, 1, 100];
+    let mut encoded_ints: Vec<(i64, Vec<u8>)> = int_values
+        .iter()
+        .map(|&val| {
+            let encoded = encode_values(&[Value::new_int64(val)]);
+            (val, encoded)
+        })
+        .collect();
+    
+    // Sort by encoded bytes
+    encoded_ints.sort_by(|a, b| a.1.cmp(&b.1));
+    
+    println!("Values sorted by their encoded bytes:");
+    for (original, encoded) in &encoded_ints {
+        println!("  {}: {:02x?}", original, encoded);
+    }
+    
+    let sorted_values: Vec<i64> = encoded_ints.iter().map(|(val, _)| *val).collect();
+    println!("Lexicographic order matches numeric order: {}\n", 
+             sorted_values == vec![-100, -1, 0, 1, 100]);
+    
+    // Test string ordering
+    println!("2. String Ordering Test:");
+    let string_values = vec![
+        b"".to_vec(),
+        b"a".to_vec(),
+        b"ab".to_vec(),
+        b"abc".to_vec(),
+        b"b".to_vec(),
+        b"hello\x00world".to_vec(), // Contains null byte
+        b"hello\x01world".to_vec(), // Contains escape byte
+    ];
+    
+    let mut encoded_strings: Vec<(Vec<u8>, Vec<u8>)> = string_values
+        .iter()
+        .map(|val| {
+            let encoded = encode_values(&[Value::new_str(&val.clone())]);
+            (val.clone(), encoded)
+        })
+        .collect();
+    
+    // Sort by encoded bytes
+    encoded_strings.sort_by(|a, b| a.1.cmp(&b.1));
+    
+    println!("Strings sorted by their encoded bytes:");
+    for (original, encoded) in &encoded_strings {
+        println!("  {:?}: {:02x?}", 
+                String::from_utf8_lossy(original), 
+                encoded);
+    }
+    
+    // Test composite keys
+    println!("\n3. Composite Key Test:");
+    let composite_keys = vec![
+        vec![Value::new_int64(1), Value::new_str(&b"apple".to_vec())],
+        vec![Value::new_int64(1), Value::new_str(&b"banana".to_vec())],
+        vec![Value::new_int64(2), Value::new_str(&b"apple".to_vec())],
+        vec![Value::new_int64(-1), Value::new_str(&b"zebra".to_vec())],
+    ];
+    
+    let mut encoded_composite: Vec<(Vec<Value>, Vec<u8>)> = composite_keys
+        .iter()
+        .map(|vals| {
+            let encoded = encode_values(vals);
+            (vals.clone(), encoded)
+        })
+        .collect();
+    
+    encoded_composite.sort_by(|a, b| a.1.cmp(&b.1));
+    
+    println!("Composite keys sorted by encoded bytes:");
+    for (original, encoded) in &encoded_composite {
+        print!("  [");
+        for (i, val) in original.iter().enumerate() {
+            if i > 0 { print!(", "); }
+            match val.typ {
+                TYPE_INT64 => print!("{}", val.i64),
+                TYPE_BYTES => print!("{:?}", String::from_utf8_lossy(&val.str)),
+                _ => {}
+            }
+        }
+        println!("]: {:02x?}", encoded);
+    }
+}
+
+
+#[test]
+fn test_integer_order_preservation() {
+    let values = vec![-1000, -1, 0, 1, 1000];
+    let mut encoded: Vec<Vec<u8>> = values
+        .iter()
+        .map(|&v| encode_values(&[Value::new_int64(v)]))
+        .collect();
+    
+    let original_encoded = encoded.clone();
+    encoded.sort();
+    
+    // Encoded values should already be in sorted order
+    assert_eq!(encoded, original_encoded);
+}
+
+#[test]
+fn test_string_escaping() {
+    let test_cases = vec![
+        (vec![0], vec![1, 1]),           // null -> escape
+        (vec![1], vec![1, 2]),           // escape -> double escape  
+        (vec![0, 1], vec![1, 1, 1, 2]),  // null + escape
+        (vec![2, 3, 4], vec![2, 3, 4]),  // no escaping needed
+    ];
+    
+    for (input, expected) in test_cases {
+        let escaped = escape_string(&input);
+        assert_eq!(escaped, expected);
+        
+        let unescaped = unescape_string(&escaped);
+        assert_eq!(unescaped, input);
+    }
+}
+
+#[test]
+fn test_roundtrip_encoding() {
+    let original = vec![
+        Value::new_int64(-42),
+        Value::new_str(&b"hello\x00world\x01test".to_vec()),
+        Value::new_int64(42),
+    ];
+    
+    let encoded = encode_values(&original);
+    let schema = vec![TYPE_INT64, TYPE_BYTES, TYPE_INT64];
+    let decoded = decode_values(&encoded, &schema);
+    
+    assert_eq!(decoded, original);
+}
+
+
+
+//*  Ranger Qurey implementation 
+
+struct BTreeIter<'a> {
+    tree : &'a BTree,
+    path : Vec<BNode>,
+    index : Vec<u16>,
+}
+
+
+//* Range Query operator 
+
+const CMP_GE : i8 = 3;
+const CMP_GT : i8 = 2;
+const CMP_LT : i8 = -2;
+const CMP_LE : i8 = -3;
+
+impl<'a> BTreeIter<'a> {
+
+    pub fn Deref(&self) -> (Vec<u8>, Vec<u8>) {
+        //TODO
+        return (vec![], vec![]);
+    }
+    pub fn Valid(&self) -> bool {
+        // TODO
+        return false;
+    }
+    pub fn Prev(&mut self) {
+        // TODO
+    }
+    pub fn Next(&mut self) {
+        //TODO
+    }
+    
+    pub fn iterPrev(&mut self, level : i32) {
+        if self.index[level as usize] > 0 {
+            self.index[level as usize] -= 1;
+        } else if level > 0 {
+            self.iterPrev(level -1);
+        } else {
+            return;
+        }
+        if level + 1 < self.index.len() as i32 {
+            let node = &self.path[level as usize];
+            let ptr = node.getPtr(self.index[level as usize]);
+            let kid = (self.tree.get)(ptr);
+            let nkeys = kid.nkeys();
+            self.path[(level + 1) as usize] = kid;
+            self.index[(level + 1) as usize] = nkeys - 1;
+        }
+    }
+
+
+    
+}
+
+impl BTree {
+
+    pub fn seekle(&self, key : &[u8]) -> BTreeIter {
+        let mut iter = BTreeIter {
+            tree : self,
+            path : vec![],
+            index : vec![],
+        };
+        let mut ptr = self.root;
+        while ptr != 0 {
+            let node = (self.get)(ptr);
+            let index = nodeLookupLe(&node, key);
+            iter.path.push(node.clone());
+            iter.index.push(index);
+            if node.btype() == BNODE_NODE {
+                let kid = node.getPtr(index);
+                ptr = kid;
+            } else {
+                break;
+            }
+        }
+        iter
+    }
+
+    pub fn seek(&self, key : &[u8], cmp : i8) -> BTreeIter {
+        let mut iter = self.seekle(key);
+        if cmp != CMP_LE {
+            let (cur , _) = iter.Deref();
+            if !cmpOK(&cur, cmp, key) {
+                if cmp > 0 {
+                    iter.Next();
+                } else {
+                    iter.Prev();
+                }
+            }
+
+        }
+        iter
+    }
+
+
+}
+
+pub fn cmpOK(key : &[u8], cmp : i8, other : &[u8]) -> bool {
+    let r = key.cmp(other);
+    match cmp {
+        CMP_GE => r >= Ordering::Equal,  
+        CMP_GT => r == Ordering::Greater, 
+        CMP_LT => r == Ordering::Less,    
+        CMP_LE => r <= Ordering::Equal,   
+        _ => panic!("what?"),
+    }
+}
+
+struct Scanner<'a> {
+    Cmp1 : i8,
+    Cmp2 : i8,
+    Key1 : Record,
+    Key2 : Record,
+    tdef  : TableDef,
+    iter : &'a BTreeIter<'a>,
+    keyEnd : Vec<u8>,
+}
+
+impl<'a> Scanner<'a> {
+
+    pub fn valid(&self) -> bool {
+        //TODO
+        return false;
+    }
+
+    pub fn next(&mut self) {
+        //TODO
+    }
+
+    pub fn deref(&self , rec : &mut Record) {
+        //TODO
+    }
+
+
+}
