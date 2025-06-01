@@ -1677,11 +1677,14 @@ impl Record {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
+    // *  Updated table def
     name: String,
     types: Vec<u32>,
     cols: Vec<String>,
     pkeys: i32,
     prefix: u32,
+    indexes : Vec<Vec<String>>,
+    indexes_prefixes : Vec<u32>,
 }
 
 impl TableDef {
@@ -1696,6 +1699,11 @@ impl TableDef {
     }
 }
 
+
+fn checkIndexKeys(tdef : &TableDef, index : &Vec<String>) -> Result<Vec<String>, DbError> {
+    
+    //let icols = 
+}
 
 
 pub struct Db {
@@ -3271,3 +3279,7 @@ fn test_range_query() {
     
     println!("\nRange Query demonstration completed successfully!");
 }
+
+
+//* Secondary index
+

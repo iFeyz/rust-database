@@ -88,91 +88,87 @@ database.close();
 
 ---
 
-## Français
 
-### Aperçu
+# DevLog: Recent Feature Additions
 
-Ce projet implémente une base de données clé-valeur persistante en Rust utilisant des structures de données B-tree pour un stockage et une récupération efficaces des données. La base de données prend en charge les opérations de base comme la définition de valeurs, la récupération de valeurs et la suppression de paires clé-valeur. Elle assure la durabilité en persistant les données sur le disque et implémente un mécanisme de liste libre pour une réutilisation efficace des pages.
+## Range Queries (May 2023)
 
-### Composants Principaux
+Range queries enable the retrieval of multiple key-value pairs that fall within a specified range, allowing for efficient data exploration and analysis.
 
-#### Implémentation B-tree
-- **BNode**: Représente un nœud dans la structure B-tree, contenant des clés, des valeurs et des pointeurs
-- **BTree**: Gère la structure B-tree avec des opérations d'insertion, de récupération et de suppression
-- Gestion personnalisée des nœuds avec des fonctions pour diviser et fusionner les nœuds si nécessaire
+### Key Components:
+- **BTreeIter**: A new cursor-like structure that traverses the B-tree in a controlled manner
+- **Range Comparison Operators**: 
+  - `CMP_GE` (>=): Greater than or equal to
+  - `CMP_GT` (>): Greater than
+  - `CMP_LT` (<): Less than
+  - `CMP_LE` (<=): Less than or equal to
 
-#### Magasin Clé-Valeur (KV)
-- Interface principale pour les opérations de la base de données
-- Fournit des méthodes API simples: `set()`, `get()`, et `delete()`
-- Utilise des fichiers mappés en mémoire pour des E/S efficaces
-- Persiste les changements sur le disque, assurant la durabilité des données
-
-#### Liste Libre
-- Gère les pages réutilisables dans le fichier de base de données
-- Implémente un système d'allocation mémoire simple pour les pages disque
-- Optimise le stockage en réutilisant les pages libérées avant d'en allouer de nouvelles
-
-### Format de Fichier
-
-Le fichier de base de données a la structure suivante:
-- Page d'en-tête avec signature, pointeur racine, nombre de pages utilisées et tête de liste libre
-- Nœuds B-tree stockés comme pages de taille fixe (4Ko)
-- Nœuds de liste libre pour suivre les pages supprimées
-
-### Exemple d'Utilisation
-
+### Usage Example:
 ```rust
-// Créer une instance de base de données
-let path = Path::new("ma_base_de_donnees.db");
-let mut database = KV::new(path);
-
-// Ouvrir la base de données
-database.open()?;
-
-// Stocker des données
-database.set(b"utilisateur:1001", b"Jean Dupont")?;
-database.set(b"utilisateur:1002", b"Marie Martin")?;
-
-// Récupérer des données
-if let Some(value) = database.get(b"utilisateur:1001") {
-    println!("Utilisateur 1001: {}", String::from_utf8_lossy(&value));
+// Range query: retrieve all keys between "key03" and "key07" (inclusive)
+let mut iter = btree.seek(b"key03", CMP_GE);
+while iter.Valid() {
+    let (key, value) = iter.Deref();
+    // Stop if we've passed the upper bound
+    if !cmpOK(&key, CMP_LE, b"key07") {
+        break;
+    }
+    println!("{} = {}", 
+        String::from_utf8_lossy(&key), 
+        String::from_utf8_lossy(&value));
+    iter.Next();
 }
-
-// Supprimer des données
-database.delete(b"utilisateur:1001")?;
-
-// Fermer la base de données
-database.close();
 ```
 
-### Détails Techniques
+### Benefits:
+- Efficient traversal of sorted data without loading all records into memory
+- Ability to perform range-based analytics directly on the database
+- Support for pagination by using iterators to fetch fixed-size batches of results
 
-1. **Structure B-tree**:
-   - Les nœuds internes contiennent des pointeurs vers les nœuds enfants
-   - Les nœuds feuilles stockent les paires clé-valeur
-   - La structure auto-équilibrante assure des opérations en O(log n)
-   - Les nœuds se divisent lorsqu'ils deviennent trop grands
+## Order-Preserving Encoding (May 2023)
 
-2. **Gestion de la Mémoire**:
-   - Utilise des fichiers mappés en mémoire pour des E/S efficaces
-   - Maintient une liste libre pour réutiliser les pages supprimées
-   - Fait croître le fichier selon les besoins, par incréments pour réduire la fragmentation
+A critical feature enabling range queries is our order-preserving encoding system, which ensures that lexicographic comparison of encoded values matches the logical ordering of the original values.
 
-3. **Concurrence**:
-   - L'implémentation actuelle est mono-thread
-   - Les améliorations futures pourraient ajouter la sécurité des threads
+### Encoding Features:
+- **Integer Encoding**: Transforms integers to maintain sort order (including negative numbers)
+- **String Encoding**: Escapes null bytes and control characters to preserve lexicographic ordering
+- **Composite Key Encoding**: Maintains correct ordering for multi-part keys
 
-4. **Durabilité**:
-   - Les mises à jour sont écrites sur le disque avant que les opérations ne se terminent
-   - La page maître assure la cohérence après les crashs
-   - Toutes les opérations assurent des mises à jour atomiques du fichier de base de données
+### Key Benefits:
+- **Correct Sorting**: Ensures `int64` values like -100, -1, 0, 1, 100 are properly ordered after encoding
+- **Binary-Safe**: Properly handles binary data containing null bytes or other special characters
+- **Efficient Comparison**: Allows direct byte comparison without decoding, improving performance
 
-### Considérations de Performance
+## Scanner Implementation (May 2023)
 
-- Taille de page fixe de 4Ko, optimisée pour la plupart des systèmes de fichiers
-- La structure B-tree assure une complexité temporelle logarithmique pour les opérations
-- Le mappage mémoire fournit un accès efficace aux pages de la base de données
-- La liste libre réduit le gaspillage d'espace disque et la fragmentation
+The Scanner provides a high-level interface for database queries, especially for the tabular database layer built on top of the key-value store.
 
+### Features:
+- **Composite Key Support**: Handles queries against multi-column primary keys
+- **Customizable Range Boundaries**: Supports various comparison operations for range limits
+- **Integration with TableDef**: Works with the schema information from table definitions
 
-# rust-database
+### Technical Details:
+- Translates high-level query constraints into low-level B-tree operations
+- Manages the lifecycle of iterators and properly handles their creation and cleanup
+- Provides a uniform interface regardless of the underlying index structure
+
+## Secondary Indexes (WIP)
+
+*Note: This feature is currently under development*
+
+Secondary indexes will enhance query capabilities by allowing efficient lookups on non-primary key columns.
+
+### Planned Features:
+- **Automatic Index Maintenance**: Indexes automatically updated when records change
+- **Multi-Column Indexes**: Support for composite indexes on multiple columns
+- **Index-Based Query Optimization**: Query planner that selects the most efficient index
+
+### Current Status:
+- Base infrastructure for secondary indexes has been implemented
+- Testing with various data patterns and query types is ongoing
+- Performance optimization and space efficiency improvements in progress
+
+---
+
+These new features significantly enhance the capabilities of our database, bringing it closer to a full-featured database management system while maintaining the simplicity and efficiency of the original key-value store design.
